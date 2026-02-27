@@ -34,8 +34,8 @@ class ColorProcessor:
 
         self.color_targets: List[ColorTarget] = [
             ColorTarget("Gray", (0, 0, 130), 0.0, (130, 130, 130)),
-            ColorTarget("Light Blue", (98, 125, 200), 5.0, (220, 180, 90)),
-            ColorTarget("Dark Navy", (112, 200, 55), 10.0, (60, 30, 10)),
+            ColorTarget("Light Blue", (98, 125, 200), 1.2, (220, 180, 90)),
+            ColorTarget("Dark Navy", (112, 200, 55), 2.4, (60, 30, 10)),
         ]
 
         self.layer_specs: List[LayerSpec] = [

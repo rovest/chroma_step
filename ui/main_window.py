@@ -97,6 +97,7 @@ class LayerState:
 
 class LayerWidget(QFrame):
     tolerance_released = pyqtSignal()
+    HEIGHT_STEP_MM = 1.2
 
     def __init__(self, state: LayerState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -127,9 +128,9 @@ class LayerWidget(QFrame):
         self.z_spin = QDoubleSpinBox()
         self.z_spin.setRange(0.0, 100.0)
         self.z_spin.setDecimals(1)
-        self.z_spin.setSingleStep(0.5)
+        self.z_spin.setSingleStep(self.HEIGHT_STEP_MM)
         self.z_spin.setSuffix(" mm")
-        self.z_spin.setValue(self.state.target.default_z)
+        self.z_spin.setValue(float(self.state.target.default_z))
         self.z_spin.setButtonSymbols(QDoubleSpinBox.UpDownArrows)
 
         row.addWidget(color_text)
@@ -421,7 +422,7 @@ class MainWindow(QMainWindow):
             color_bgr = tuple(int(v) for v in cluster["color_bgr"])
             color_hsv = tuple(int(v) for v in cluster["color_hsv"])
             tolerance = int(cluster["tolerance"])
-            z_height = float(idx * 5.0)
+            z_height = float(idx * LayerWidget.HEIGHT_STEP_MM)
 
             target = ColorTarget(
                 name=f"Cluster {idx + 1}",
