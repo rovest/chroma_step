@@ -160,7 +160,11 @@ class CADWorker(QThread):
             for solid in all_solids:
                 self._check_interruption()
                 try:
-                    temp_mesh = MeshPart.meshFromShape(Shape=solid, MaxLength=0.5)
+                    temp_mesh = MeshPart.meshFromShape(
+                        Shape=solid,
+                        LinearDeflection=0.1,
+                        AngularDeflection=0.1,
+                    )
                     final_mesh.addMesh(temp_mesh)
                     meshed_solid_count += 1
                 except Exception:

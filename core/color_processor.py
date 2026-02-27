@@ -95,7 +95,7 @@ class ColorProcessor:
             raise ValueError("No image is loaded. Call load_image first.")
 
         contour_min_area = 50.0 if min_area is None else float(min_area)
-        hole_min_area = 20.0
+        hole_min_area = 100.0
         upscale_factor = 2
         payload: List[Dict[str, Any]] = []
 
@@ -111,10 +111,11 @@ class ColorProcessor:
                 None,
                 fx=upscale_factor,
                 fy=upscale_factor,
-                interpolation=cv2.INTER_NEAREST,
+                interpolation=cv2.INTER_LINEAR,
             )
             close_kernel = np.ones((3, 3), dtype=np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+            mask = cv2.GaussianBlur(mask, (5, 5), 0)
             _, contour_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
             contours, hierarchy = cv2.findContours(
                 contour_mask,
@@ -263,7 +264,7 @@ class ColorProcessor:
         if perimeter <= 0:
             return None
 
-        epsilon = max(0.25, 0.0005 * perimeter)
+        epsilon = max(0.5, 0.001 * perimeter)
         simplified = cv2.approxPolyDP(contour, epsilon, True)
         if len(simplified) < 3:
             return None
