@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -28,20 +30,23 @@ class CADWorker(QThread):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        # Unified DTO: [{"layer_name": str, "z_height": float, "contours": list}]
+        # Unified DTO: [{"layer_name": str, "z_height": float, "shapes": list}]
         self.payload = [dict(item) for item in payload]
         self.image_path = image_path
-        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        default_root = Path.home() / "ChromaStep" / "exports"
+        self.output_dir = Path(output_dir) if output_dir else default_root
         self.scale_factor = float(scale_factor)
 
     def run(self) -> None:
         freecad = None
         part = None
         doc = None
+        export_dir: Path | None = None
 
         try:
             self._ensure_freecad_path()
             import FreeCAD as freecad  # type: ignore
+            import Mesh  # type: ignore
             import MeshPart  # type: ignore
             import Part as part  # type: ignore
 
@@ -53,89 +58,186 @@ class CADWorker(QThread):
             if not self.payload:
                 raise ValueError("Worker payload is empty.")
 
-            total_contours = sum(len(layer.get("contours", [])) for layer in self.payload)
-            if total_contours == 0:
-                raise ValueError("No contours provided for CAD generation.")
+            total_shapes = sum(len(layer.get("shapes", [])) for layer in self.payload)
+            if total_shapes == 0:
+                raise ValueError("No shapes provided for CAD generation.")
 
-            solids: list[Any] = []
-            processed_contours = 0
+            all_solids: list[Any] = []
+            processed_shapes = 0
 
             for layer in self.payload:
                 self._check_interruption()
 
                 layer_name = str(layer.get("layer_name", "Layer"))
                 z_height = float(layer.get("z_height", 0.0))
-                contours = layer.get("contours", [])
+                shapes = layer.get("shapes", [])
 
                 # Absolute stepped rule: every layer extrudes from Z=0.0 to target z_height.
                 base_z = 0.0
                 thickness = z_height
                 if thickness <= 0:
-                    processed_contours += len(contours)
+                    processed_shapes += len(shapes)
                     continue
 
                 self.status_signal.emit(f"Extruding {layer_name}...")
-                for contour in contours:
+                for shape in shapes:
                     self._check_interruption()
-                    vectors = self._contour_to_vectors(freecad, contour, base_z)
-                    if len(vectors) < 4:
-                        processed_contours += 1
+                    outer_wire = self._points_to_wire(
+                        freecad,
+                        part,
+                        shape.get("outer", []),
+                        base_z,
+                    )
+                    if outer_wire is None:
+                        processed_shapes += 1
                         continue
 
-                    wire = part.makePolygon(vectors)
-                    if wire.isNull() or not wire.isClosed():
-                        processed_contours += 1
+                    hole_wires: list[Any] = []
+                    for hole_points in shape.get("holes", []):
+                        hole_wire = self._points_to_wire(freecad, part, hole_points, base_z)
+                        if hole_wire is not None:
+                            hole_wires.append(hole_wire)
+
+                    try:
+                        face = part.Face([outer_wire] + hole_wires)
+                        if not face.isValid() or face.Area < 1.0:
+                            raise ValueError("Invalid face with holes")
+                    except Exception:
+                        try:
+                            face = part.Face(outer_wire)
+                        except Exception:
+                            processed_shapes += 1
+                            continue
+
+                    if face.isNull() or not face.isValid() or face.Area < 1.0:
+                        processed_shapes += 1
                         continue
 
-                    face = part.Face(wire)
-                    if face.isNull():
-                        processed_contours += 1
-                        continue
+                    solid = face.extrude(freecad.Vector(0, 0, thickness))
+                    try:
+                        if solid.isValid() and solid.Volume > 1.0:
+                            all_solids.append(solid)
+                    except Exception:
+                        pass
 
-                    extruded = face.extrude(freecad.Vector(0, 0, thickness))
-                    if not extruded.isNull():
-                        solids.append(extruded)
-
-                    processed_contours += 1
-                    progress = 5 + int((processed_contours / total_contours) * 75)
+                    processed_shapes += 1
+                    progress = 5 + int((processed_shapes / total_shapes) * 75)
                     self.progress_signal.emit(min(progress, 80))
 
-            if not solids:
+            if not all_solids:
                 raise ValueError("No valid solids could be generated from contours.")
 
             self._check_interruption()
-            self.status_signal.emit("Applying Boolean Union...")
+            self.status_signal.emit("Preparing export solids...")
             self.progress_signal.emit(85)
-            fused_solid = self._fuse_solids(part, solids)
-
-            self._check_interruption()
-            obj = doc.addObject("Part::Feature", "FinalRelief")
-            obj.Shape = fused_solid
-            doc.recompute()
 
             stem = Path(self.image_path).stem if self.image_path else "chromastep_model"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            step_path = self.output_dir / f"{stem}_{timestamp}.step"
-            stl_path = self.output_dir / f"{stem}_{timestamp}.stl"
+            safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "chromastep_model"
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            export_dir = self.output_dir / f"{timestamp}_{safe_stem}"
+            export_dir.mkdir(parents=True, exist_ok=True)
+
+            step_path = export_dir / "final_relief.step"
+            stl_path = export_dir / "final_relief.stl"
+            metadata_path = export_dir / "metadata.json"
 
             self.status_signal.emit("Exporting STEP...")
             self.progress_signal.emit(92)
-            fused_solid.exportStep(str(step_path))
+            solid_features: list[Any] = []
+            for index, solid in enumerate(all_solids):
+                self._check_interruption()
+                feature = doc.addObject("Part::Feature", f"Relief_{index:04d}")
+                feature.Shape = solid
+                solid_features.append(feature)
+            doc.recompute()
+            part.export(solid_features, str(step_path))
 
             self._check_interruption()
             self.status_signal.emit("Exporting STL...")
             self.progress_signal.emit(97)
-            mesh = MeshPart.meshFromShape(Shape=fused_solid, MaxLength=1.0)
-            mesh.write(str(stl_path))
+            final_mesh = Mesh.Mesh()
+            meshed_solid_count = 0
+            for solid in all_solids:
+                self._check_interruption()
+                try:
+                    temp_mesh = MeshPart.meshFromShape(Shape=solid, MaxLength=0.5)
+                    final_mesh.addMesh(temp_mesh)
+                    meshed_solid_count += 1
+                except Exception:
+                    continue
+
+            if meshed_solid_count == 0:
+                raise ValueError("No valid solid could be meshed into STL.")
+
+            try:
+                final_mesh.removeDuplicatedPoints()
+            except Exception:
+                pass
+            try:
+                final_mesh.removeDuplicatedFacets()
+            except Exception:
+                pass
+            try:
+                final_mesh.removeDegeneratedFacets()
+            except Exception:
+                pass
+            try:
+                final_mesh.removeNonManifolds()
+            except Exception:
+                pass
+            try:
+                final_mesh.fillupHoles()
+            except Exception:
+                pass
+            final_mesh.write(str(stl_path))
+
+            metadata = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "image_path": self.image_path,
+                "scale_factor": self.scale_factor,
+                "output_directory": str(export_dir),
+                "outputs": {
+                    "step": str(step_path),
+                    "stl": str(stl_path),
+                },
+                "layers": [
+                    {
+                        "layer_name": str(layer.get("layer_name", "")),
+                        "z_height": float(layer.get("z_height", 0.0)),
+                        "shape_count": len(layer.get("shapes", [])),
+                    }
+                    for layer in self.payload
+                ],
+                "valid_solid_count": len(all_solids),
+                "meshed_solid_count": meshed_solid_count,
+            }
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
             self.progress_signal.emit(100)
             self.status_signal.emit("CAD generation complete.")
-            self.finished_signal.emit(True, f"STEP: {step_path}\nSTL: {stl_path}")
+            self.finished_signal.emit(
+                True,
+                (
+                    f"EXPORT_DIR: {export_dir}\n"
+                    f"STEP: {step_path}\n"
+                    f"STL: {stl_path}\n"
+                    f"METADATA: {metadata_path}"
+                ),
+            )
 
         except InterruptedError as exc:
             self.status_signal.emit("Generation canceled by user.")
             self.finished_signal.emit(False, str(exc))
         except Exception as exc:
+            if export_dir is not None:
+                try:
+                    error_log = export_dir / "error.log"
+                    error_log.write_text(
+                        f"{datetime.now().isoformat(timespec='seconds')}\n{exc}\n",
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             self.error_signal.emit(str(exc))
         finally:
             if freecad is not None and doc is not None:
@@ -152,43 +254,30 @@ class CADWorker(QThread):
         if self.isInterruptionRequested():
             raise InterruptedError("User cancelled operation.")
 
-    def _fuse_solids(self, part: Any, solids: list[Any]):
-        if len(solids) == 1:
-            return solids[0]
+    def _points_to_wire(self, freecad: Any, part: Any, points: Any, base_z: float):
+        if not points:
+            return None
 
-        try:
-            fused = part.MultiFuse(solids)
-            return fused.removeSplitter()
-        except Exception:
-            fused = solids[0]
-            for next_solid in solids[1:]:
-                self._check_interruption()
-                fused = fused.fuse(next_solid)
-            return fused.removeSplitter() if hasattr(fused, "removeSplitter") else fused
-
-    def _contour_to_vectors(self, freecad: Any, contour: Any, base_z: float) -> list[Any]:
-        points: list[tuple[float, float]] = []
-        for item in contour:
-            if len(item) == 1:
-                x_raw, y_raw = item[0]
-            else:
-                x_raw, y_raw = item
+        vectors: list[Any] = []
+        for item in points:
+            x_raw, y_raw = item
             x = float(x_raw) * self.scale_factor
             y = float(y_raw) * self.scale_factor
-            points.append((x, y))
+            vec = freecad.Vector(x, y, base_z)
+            if not vectors or (vec.x != vectors[-1].x or vec.y != vectors[-1].y):
+                vectors.append(vec)
 
-        # Remove consecutive duplicates.
-        normalized: list[tuple[float, float]] = []
-        for p in points:
-            if not normalized or normalized[-1] != p:
-                normalized.append(p)
+        if len(vectors) < 3:
+            return None
+        if vectors[0] == vectors[-1]:
+            vectors.pop()
+        if len(vectors) < 3:
+            return None
+        vectors.append(vectors[0])
 
-        # Handle OpenCV-style already-closed contours and close exactly once.
-        if normalized and normalized[0] == normalized[-1]:
-            normalized.pop()
-        if len(normalized) < 3:
-            return []
-        normalized.append(normalized[0])
-
-        return [freecad.Vector(x, y, base_z) for x, y in normalized]
-
+        wire = part.makePolygon(vectors)
+        if wire.isNull() or not wire.isClosed():
+            return None
+        if hasattr(wire, "isValid") and not wire.isValid():
+            return None
+        return wire

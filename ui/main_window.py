@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List
 
 import cv2
 import numpy as np
+import pyvista as pv
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt5.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QFileDialog,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -20,9 +24,12 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSlider,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtCore import QUrl
+from pyvistaqt import QtInteractor
 
 from core.color_processor import ColorProcessor, ColorTarget
 from ui.worker import CADWorker
@@ -85,6 +92,7 @@ class LayerState:
     target_index: int
     target: ColorTarget
     layer_title: str
+    initial_tolerance: int = 35
 
 
 class LayerWidget(QFrame):
@@ -140,7 +148,7 @@ class LayerWidget(QFrame):
 
         self.tolerance_slider = QSlider(Qt.Horizontal)
         self.tolerance_slider.setRange(0, 255)
-        self.tolerance_slider.setValue(35)
+        self.tolerance_slider.setValue(int(np.clip(self.state.initial_tolerance, 0, 255)))
         self.tolerance_slider.sliderReleased.connect(self.tolerance_released.emit)
 
         slider_row.addWidget(narrow)
@@ -166,6 +174,7 @@ class MainWindow(QMainWindow):
         self.layer_widgets: List[LayerWidget] = []
         self.image_path: str | None = None
         self.worker: CADWorker | None = None
+        self.recent_export_dirs: List[str] = []
 
         self._build_ui()
         self._init_default_layers()
@@ -190,7 +199,26 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(left_header)
 
         self.original_section = VisualSection("Original Image", "No file loaded")
-        self.mask_section = VisualSection("Live Segmentation Map (Mask)", "Mask Preview")
+        self.mask_section = QFrame()
+        self.mask_section.setFrameShape(QFrame.StyledPanel)
+        mask_layout = QVBoxLayout(self.mask_section)
+        mask_layout.setContentsMargins(6, 4, 6, 6)
+        mask_layout.setSpacing(3)
+        self.mask_title_label = QLabel("Live Segmentation Map (Mask) / 3D Viewer")
+        self.mask_title_label.setAlignment(Qt.AlignCenter)
+        self.view_stack = QStackedWidget()
+        self.mask_preview_label = PreviewLabel()
+        self.viewer = QtInteractor(self)
+        self.viewer.set_background("#0f1520")
+        self.view_stack.addWidget(self.mask_preview_label)  # index 0: 2D mask
+        self.view_stack.addWidget(self.viewer)  # index 1: 3D model
+        self.view_stack.setCurrentIndex(0)
+        self.mask_footer_label = QLabel("Mask Preview")
+        self.mask_footer_label.setAlignment(Qt.AlignCenter)
+        self.mask_footer_label.setStyleSheet("color: #b6bfcc;")
+        mask_layout.addWidget(self.mask_title_label)
+        mask_layout.addWidget(self.view_stack, 1)
+        mask_layout.addWidget(self.mask_footer_label)
         left_layout.addWidget(self.original_section, 1)
         left_layout.addWidget(self.mask_section, 1)
 
@@ -226,6 +254,13 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.export_stl_btn)
         right_layout.addWidget(self.export_step_btn)
 
+        self.recent_label = QLabel("Recent Results")
+        self.recent_list = QListWidget()
+        self.recent_list.setMaximumHeight(120)
+        self.recent_list.itemDoubleClicked.connect(self._open_recent_result)
+        right_layout.addWidget(self.recent_label)
+        right_layout.addWidget(self.recent_list)
+
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 7)
@@ -254,8 +289,8 @@ class MainWindow(QMainWindow):
         ]
         for i, title in enumerate(defaults):
             target = self.processor.color_targets[i % len(self.processor.color_targets)]
-            layer = LayerWidget(LayerState(i, target, title))
-            layer.tolerance_released.connect(self._update_mask_preview)
+            layer = LayerWidget(LayerState(i, target, title, initial_tolerance=35))
+            layer.tolerance_released.connect(self._on_tolerance_adjusted)
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, layer)
             self.layer_widgets.append(layer)
 
@@ -335,20 +370,78 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        try:
-            self.processor.load_image(path)
-        except FileNotFoundError:
+        image_bgr = cv2.imread(path)
+        if image_bgr is None:
             self.image_path = None
             self.original_section.preview_label.clear_preview()
-            self.mask_section.preview_label.clear_preview()
+            self.mask_preview_label.clear_preview()
             self.status_label.setText("Status: Failed to load image.")
             return
 
+        height, width = image_bgr.shape[:2]
+        if width >= 640 or height >= 640:
+            QMessageBox.warning(
+                self,
+                "Image Too Large",
+                "Image resolution too high. Please select an image smaller than 640x640 pixels.",
+            )
+            return
+
+        color_clusters = self.processor.analyze_image_colors(image_bgr, k_clusters=5)
+        if not color_clusters:
+            QMessageBox.warning(
+                self,
+                "Color Analysis Failed",
+                "No valid dominant color clusters were detected in this image.",
+            )
+            return
+
+        self.processor.set_image(image_bgr)
+
         self.image_path = path
+        self._rebuild_layers_from_clusters(color_clusters)
         self.generate_btn.setEnabled(True)
         self._set_original_preview(path)
+        self.view_stack.setCurrentIndex(0)
+        self.mask_footer_label.setText("Mask Preview")
         self._update_mask_preview()
         self.status_label.setText("Status: Image loaded. Configure layers and click Generate.")
+
+    def _clear_layer_widgets(self) -> None:
+        for layer in self.layer_widgets:
+            self.layer_layout.removeWidget(layer)
+            layer.deleteLater()
+        self.layer_widgets.clear()
+
+    def _rebuild_layers_from_clusters(self, clusters: List[dict[str, object]]) -> None:
+        self._clear_layer_widgets()
+        self.processor.color_targets = []
+
+        for idx, cluster in enumerate(clusters):
+            color_bgr = tuple(int(v) for v in cluster["color_bgr"])
+            color_hsv = tuple(int(v) for v in cluster["color_hsv"])
+            tolerance = int(cluster["tolerance"])
+            z_height = float(idx * 5.0)
+
+            target = ColorTarget(
+                name=f"Cluster {idx + 1}",
+                base_hsv=color_hsv,
+                default_z=z_height,
+                swatch_bgr=color_bgr,
+            )
+            self.processor.color_targets.append(target)
+
+            layer = LayerWidget(
+                LayerState(
+                    target_index=idx,
+                    target=target,
+                    layer_title=f"Layer {idx + 1}: {target.name}",
+                    initial_tolerance=tolerance,
+                )
+            )
+            layer.tolerance_released.connect(self._on_tolerance_adjusted)
+            self.layer_layout.insertWidget(self.layer_layout.count() - 1, layer)
+            self.layer_widgets.append(layer)
 
     def _set_original_preview(self, path: str) -> None:
         pixmap = QPixmap(path)
@@ -372,7 +465,12 @@ class MainWindow(QMainWindow):
         if combined is None:
             return
         pixmap = self._mask_to_pixmap(combined)
-        self.mask_section.preview_label.set_preview_pixmap(pixmap)
+        self.mask_preview_label.set_preview_pixmap(pixmap)
+
+    def _on_tolerance_adjusted(self) -> None:
+        self.view_stack.setCurrentIndex(0)
+        self.mask_footer_label.setText("Mask Preview")
+        self._update_mask_preview()
 
     def _collect_generation_layers(self) -> list[dict[str, Any]]:
         return [
@@ -422,7 +520,11 @@ class MainWindow(QMainWindow):
         self.generate_btn.setEnabled(self.processor.has_image)
         if success:
             self.status_label.setText("Status: CAD generation complete.")
-            QMessageBox.information(self, "Generation Complete", message)
+            self._render_stl_in_viewer(message)
+            export_dir = self._extract_export_dir(message)
+            if export_dir:
+                self._add_recent_export(export_dir)
+            self._show_generation_complete_dialog(message, export_dir)
         else:
             self.status_label.setText("Status: CAD generation canceled.")
             QMessageBox.warning(self, "Generation Canceled", message)
@@ -441,6 +543,85 @@ class MainWindow(QMainWindow):
 
     def _on_progress_changed(self, value: int) -> None:
         self.progress_percent.setText(f"{value}%")
+
+    def _render_stl_in_viewer(self, worker_message: str) -> None:
+        stl_path = self._extract_stl_path(worker_message)
+        if not stl_path:
+            return
+        try:
+            self.viewer.clear()
+            mesh = pv.read(stl_path)
+            cleaned_mesh = mesh.clean(point_merging=True, tolerance=1e-5).triangulate()
+            if cleaned_mesh.n_points == 0:
+                QMessageBox.warning(
+                    self,
+                    "3D Preview Warning",
+                    "Loaded STL contains no valid points after cleanup.",
+                )
+                return
+            self.viewer.add_mesh(
+                cleaned_mesh,
+                color="lightblue",
+                show_edges=False,
+                smooth_shading=True,
+                split_sharp_edges=True,
+            )
+            self.viewer.reset_camera()
+            self.mask_footer_label.setText(Path(stl_path).name)
+            self.view_stack.setCurrentIndex(1)
+        except Exception as exc:
+            QMessageBox.warning(self, "3D Preview Error", f"Failed to load STL preview:\n{exc}")
+
+    def _show_generation_complete_dialog(self, message: str, export_dir: str | None) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Generation Complete")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText("3D model files were generated successfully.")
+        dialog.setDetailedText(message)
+        open_btn = dialog.addButton("Open Folder", QMessageBox.ActionRole)
+        dialog.addButton(QMessageBox.Ok)
+        dialog.exec_()
+        if dialog.clickedButton() is open_btn and export_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(export_dir))
+
+    def _add_recent_export(self, export_dir: str) -> None:
+        if export_dir in self.recent_export_dirs:
+            self.recent_export_dirs.remove(export_dir)
+        self.recent_export_dirs.insert(0, export_dir)
+        self.recent_export_dirs = self.recent_export_dirs[:5]
+
+        self.recent_list.clear()
+        for path in self.recent_export_dirs:
+            item = QListWidgetItem(Path(path).name)
+            item.setData(Qt.UserRole, path)
+            self.recent_list.addItem(item)
+
+    def _open_recent_result(self, item: QListWidgetItem) -> None:
+        path = item.data(Qt.UserRole)
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    @staticmethod
+    def _extract_stl_path(text: str) -> str | None:
+        candidate_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in candidate_lines:
+            lower = line.lower()
+            if lower.startswith("stl:"):
+                path = line.split(":", 1)[1].strip()
+                return path if path else None
+            if lower.endswith(".stl"):
+                return line
+        return None
+
+    @staticmethod
+    def _extract_export_dir(text: str) -> str | None:
+        candidate_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in candidate_lines:
+            lower = line.lower()
+            if lower.startswith("export_dir:"):
+                path = line.split(":", 1)[1].strip()
+                return path if path else None
+        return None
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self.worker is not None and self.worker.isRunning():

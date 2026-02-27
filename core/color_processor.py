@@ -61,6 +61,8 @@ class ColorProcessor:
     def build_mask_for_target(self, target_index: int, tolerance: int) -> np.ndarray:
         if self.image_hsv is None:
             raise ValueError("No image is loaded. Call load_image first.")
+        if not self.color_targets:
+            raise ValueError("No color targets are available for masking.")
         target = self.color_targets[target_index % len(self.color_targets)]
         return self._mask_from_hsv(target.base_hsv, tolerance)
 
@@ -87,12 +89,14 @@ class ColorProcessor:
         """Return worker DTO payload with OpenCV contours per layer.
 
         DTO schema:
-        [{"layer_name": str, "z_height": float, "contours": list}]
+        [{"layer_name": str, "z_height": float, "shapes": list}]
         """
         if self.image_hsv is None:
             raise ValueError("No image is loaded. Call load_image first.")
 
-        contour_min_area = self.min_area if min_area is None else float(min_area)
+        contour_min_area = 50.0 if min_area is None else float(min_area)
+        hole_min_area = 20.0
+        upscale_factor = 2
         payload: List[Dict[str, Any]] = []
 
         for layer in layer_settings:
@@ -102,27 +106,185 @@ class ColorProcessor:
             z_height = float(layer["z_height"])
 
             mask = self.build_mask_for_target(target_index, tolerance)
-            mask = self._clean_mask(mask)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask = cv2.resize(
+                mask,
+                None,
+                fx=upscale_factor,
+                fy=upscale_factor,
+                interpolation=cv2.INTER_NEAREST,
+            )
+            close_kernel = np.ones((3, 3), dtype=np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+            _, contour_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            contours, hierarchy = cv2.findContours(
+                contour_mask,
+                cv2.RETR_CCOMP,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
 
-            filtered_contours: List[np.ndarray] = []
-            for contour in contours:
-                if cv2.contourArea(contour) < contour_min_area:
-                    continue
-                epsilon = self.approx_factor * cv2.arcLength(contour, True)
-                simplified = cv2.approxPolyDP(contour, epsilon, True)
-                if len(simplified) >= 3:
-                    filtered_contours.append(simplified)
+            shapes: List[Dict[str, Any]] = []
+            if hierarchy is not None and len(contours) > 0:
+                h = hierarchy[0]
+                for idx, contour in enumerate(contours):
+                    parent = int(h[idx][3])
+                    if parent != -1:
+                        continue
+
+                    outer_points = self._simplify_contour(
+                        contour,
+                        contour_min_area * (upscale_factor**2),
+                        upscale_factor,
+                    )
+                    if outer_points is None:
+                        continue
+
+                    hole_points_list: List[List[Tuple[int, int]]] = []
+                    child_idx = int(h[idx][2])
+                    while child_idx != -1:
+                        hole = contours[child_idx]
+                        hole_points = self._simplify_contour(
+                            hole,
+                            hole_min_area * (upscale_factor**2),
+                            upscale_factor,
+                        )
+                        if hole_points is not None:
+                            hole_points_list.append(hole_points)
+                        child_idx = int(h[child_idx][0])
+
+                    shapes.append({"outer": outer_points, "holes": hole_points_list})
 
             payload.append(
                 {
                     "layer_name": layer_name,
                     "z_height": z_height,
-                    "contours": filtered_contours,
+                    "shapes": shapes,
                 }
             )
 
         return payload
+
+    def analyze_image_colors(
+        self,
+        image_bgr: np.ndarray,
+        k_clusters: int = 5,
+    ) -> List[Dict[str, object]]:
+        """Analyze dominant image colors without downsampling.
+
+        Returns:
+            [
+                {
+                    "color_bgr": (b, g, r),
+                    "color_hsv": (h, s, v),
+                    "tolerance": int,
+                },
+                ...
+            ]
+            Sorted by cluster area (largest first).
+        """
+        if image_bgr is None or image_bgr.size == 0:
+            raise ValueError("Empty image provided for color analysis.")
+
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        pixels_hsv = hsv.reshape((-1, 3)).astype(np.float32)
+
+        total_pixels = pixels_hsv.shape[0]
+        if total_pixels == 0:
+            return []
+
+        k = max(1, min(int(k_clusters), total_pixels))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2)
+        _compactness, labels, centers = cv2.kmeans(
+            pixels_hsv,
+            k,
+            None,
+            criteria,
+            5,
+            cv2.KMEANS_PP_CENTERS,
+        )
+
+        labels = labels.flatten()
+        min_area_pixels = int(total_pixels * 0.02)
+
+        results: List[Dict[str, object]] = []
+        for idx in range(k):
+            cluster_mask = labels == idx
+            area = int(np.count_nonzero(cluster_mask))
+            if area < min_area_pixels:
+                continue
+
+            cluster_hsv = pixels_hsv[cluster_mask]
+            if cluster_hsv.shape[0] == 0:
+                continue
+
+            std_h = float(np.std(cluster_hsv[:, 0]))
+            std_s = float(np.std(cluster_hsv[:, 1]))
+            tolerance = int(np.clip(max(std_h, std_s), 10, 60))
+
+            center_hsv = centers[idx]
+            h = int(np.clip(round(center_hsv[0]), 0, 179))
+            s = int(np.clip(round(center_hsv[1]), 0, 255))
+            v = int(np.clip(round(center_hsv[2]), 0, 255))
+            color_hsv = (h, s, v)
+
+            hsv_patch = np.uint8([[[h, s, v]]])
+            bgr_patch = cv2.cvtColor(hsv_patch, cv2.COLOR_HSV2BGR)[0][0]
+            color_bgr = (int(bgr_patch[0]), int(bgr_patch[1]), int(bgr_patch[2]))
+
+            results.append(
+                {
+                    "area": area,
+                    "color_bgr": color_bgr,
+                    "color_hsv": color_hsv,
+                    "tolerance": tolerance,
+                }
+            )
+
+        results.sort(key=lambda item: int(item["area"]), reverse=True)
+        return [
+            {
+                "color_bgr": item["color_bgr"],
+                "color_hsv": item["color_hsv"],
+                "tolerance": int(item["tolerance"]),
+            }
+            for item in results
+        ]
+
+    def _simplify_contour(
+        self,
+        contour: np.ndarray,
+        min_area: float,
+        scale_divisor: int = 1,
+    ) -> List[Tuple[int, int]] | None:
+        area = abs(cv2.contourArea(contour))
+        if area < min_area:
+            return None
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            return None
+
+        epsilon = max(0.25, 0.0005 * perimeter)
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        if len(simplified) < 3:
+            return None
+
+        points = [
+            (
+                int(round(float(pt[0][0]) / float(scale_divisor))),
+                int(round(float(pt[0][1]) / float(scale_divisor))),
+            )
+            for pt in simplified
+        ]
+        normalized: List[Tuple[int, int]] = []
+        for p in points:
+            if not normalized or normalized[-1] != p:
+                normalized.append(p)
+        points = normalized
+        if len(points) >= 2 and points[0] == points[-1]:
+            points.pop()
+        if len(points) < 3:
+            return None
+        return points
 
     def process_image(self, image_path: str) -> Dict[str, object]:
         image_bgr = cv2.imread(image_path)
