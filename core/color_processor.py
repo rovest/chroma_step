@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -78,6 +78,51 @@ class ColorProcessor:
             mask = self.build_mask_for_target(target_index, tolerance)
             combined = mask if combined is None else cv2.bitwise_or(combined, mask)
         return combined
+
+    def extract_contours_for_layers(
+        self,
+        layer_settings: Sequence[Dict[str, Any]],
+        min_area: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return worker DTO payload with OpenCV contours per layer.
+
+        DTO schema:
+        [{"layer_name": str, "z_height": float, "contours": list}]
+        """
+        if self.image_hsv is None:
+            raise ValueError("No image is loaded. Call load_image first.")
+
+        contour_min_area = self.min_area if min_area is None else float(min_area)
+        payload: List[Dict[str, Any]] = []
+
+        for layer in layer_settings:
+            target_index = int(layer["target_index"])
+            tolerance = int(layer["tolerance"])
+            layer_name = str(layer["layer_name"])
+            z_height = float(layer["z_height"])
+
+            mask = self.build_mask_for_target(target_index, tolerance)
+            mask = self._clean_mask(mask)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            filtered_contours: List[np.ndarray] = []
+            for contour in contours:
+                if cv2.contourArea(contour) < contour_min_area:
+                    continue
+                epsilon = self.approx_factor * cv2.arcLength(contour, True)
+                simplified = cv2.approxPolyDP(contour, epsilon, True)
+                if len(simplified) >= 3:
+                    filtered_contours.append(simplified)
+
+            payload.append(
+                {
+                    "layer_name": layer_name,
+                    "z_height": z_height,
+                    "contours": filtered_contours,
+                }
+            )
+
+        return payload
 
     def process_image(self, image_path: str) -> Dict[str, object]:
         image_bgr = cv2.imread(image_path)

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import cv2
 import numpy as np
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QFileDialog,
     QDoubleSpinBox,
@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -24,6 +25,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.color_processor import ColorProcessor, ColorTarget
+from ui.worker import CADWorker
 
 
 class PreviewLabel(QLabel):
@@ -163,6 +165,7 @@ class MainWindow(QMainWindow):
         self.processor = ColorProcessor()
         self.layer_widgets: List[LayerWidget] = []
         self.image_path: str | None = None
+        self.worker: CADWorker | None = None
 
         self._build_ui()
         self._init_default_layers()
@@ -213,6 +216,7 @@ class MainWindow(QMainWindow):
 
         self.generate_btn = QPushButton("Generate 3D Solid Model")
         self.generate_btn.setEnabled(False)
+        self.generate_btn.clicked.connect(self.start_generation)
         self.export_stl_btn = QPushButton("Export as STL")
         self.export_stl_btn.setEnabled(False)
         self.export_step_btn = QPushButton("Export as STEP")
@@ -369,10 +373,80 @@ class MainWindow(QMainWindow):
             return
         pixmap = self._mask_to_pixmap(combined)
         self.mask_section.preview_label.set_preview_pixmap(pixmap)
-        self.progress_bar.setValue(100)
+
+    def _collect_generation_layers(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "layer_name": layer.state.layer_title,
+                "z_height": float(layer.z_spin.value()),
+                "target_index": layer.state.target_index,
+                "tolerance": layer.current_tolerance(),
+            }
+            for layer in self.layer_widgets
+        ]
+
+    def start_generation(self) -> None:
+        if not self.processor.has_image:
+            QMessageBox.warning(self, "No Image", "Load an image before generating a 3D solid.")
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        self.generate_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Status: Starting CAD generation...")
+
+        try:
+            generation_layers = self._collect_generation_layers()
+            worker_payload = self.processor.extract_contours_for_layers(generation_layers)
+        except Exception as exc:
+            self.generate_btn.setEnabled(True)
+            QMessageBox.critical(self, "Preparation Error", str(exc))
+            return
+
+        self.worker = CADWorker(
+            payload=worker_payload,
+            image_path=self.image_path,
+            parent=self,
+        )
+        self.worker.progress_signal.connect(self.progress_bar.setValue)
+        self.worker.status_signal.connect(self._on_worker_status)
+        self.worker.finished_signal.connect(self._on_worker_finished)
+        self.worker.error_signal.connect(self._on_worker_error)
+        self.worker.start()
+
+    def _on_worker_status(self, message: str) -> None:
+        self.status_label.setText(f"Status: {message}")
+
+    def _on_worker_finished(self, success: bool, message: str) -> None:
+        self.generate_btn.setEnabled(self.processor.has_image)
+        if success:
+            self.status_label.setText("Status: CAD generation complete.")
+            QMessageBox.information(self, "Generation Complete", message)
+        else:
+            self.status_label.setText("Status: CAD generation canceled.")
+            QMessageBox.warning(self, "Generation Canceled", message)
+
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
+
+    def _on_worker_error(self, error_text: str) -> None:
+        self.generate_btn.setEnabled(self.processor.has_image)
+        self.status_label.setText("Status: CAD generation error.")
+        QMessageBox.critical(self, "CAD Worker Error", error_text)
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
 
     def _on_progress_changed(self, value: int) -> None:
         self.progress_percent.setText(f"{value}%")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait(2000)
+        event.accept()
 
     @staticmethod
     def _mask_to_pixmap(mask: np.ndarray) -> QPixmap:
@@ -383,4 +457,3 @@ class MainWindow(QMainWindow):
         h, w = rgb.shape[:2]
         image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
         return QPixmap.fromImage(image)
-
