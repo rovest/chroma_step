@@ -15,7 +15,7 @@ ChromaStep 3D는 2D 이미지를 색상별로 분리해 각 레이어를 서로 
 ## 1. 주요 기능
 
 - 원본 이미지 표시
-- 로드 시 이미지 해상도 검증 (`640x640` 미만만 허용)
+- 로드 시 이미지 해상도 검증 후, 초과 시 자동 다운스케일 여부 확인
 - 색상 자동 분석(k-means) 후 레이어 동적 생성
 - 레이어별 높이(mm), tolerance 조정
 - 2D 마스크 프리뷰 + 3D 뷰어(PyvistaQt)
@@ -79,10 +79,16 @@ python -m pip install pyvista pyvistaqt "opencv-python-headless>=4.8,<4.9" "nump
 
 ## 5. FreeCAD 경로 설정
 
-`ui/worker.py`는 아래 환경변수로 FreeCAD 라이브러리 경로를 사용합니다.
+`ui/worker.py`는 `FREECAD_BIN_PATH`와 `PYTHONPATH`를 순서대로 확인해
+FreeCAD 라이브러리 경로를 찾습니다.
 
 ```bash
 export FREECAD_BIN_PATH=/usr/lib/freecad-python3/lib
+```
+
+또는:
+```bash
+export PYTHONPATH=/usr/lib/freecad-python3/lib:$PYTHONPATH
 ```
 
 Windows 예시:
@@ -107,7 +113,7 @@ python main.py
 
 1. `Load Image...` 클릭
 2. 해상도 검사
-   - `width >= 640` 또는 `height >= 640`이면 로드 거부
+   - `width > 640` 또는 `height > 640`이면 자동 다운스케일 여부 확인
 3. 자동 색상 분석 수행
 4. 우측 레이어 UI가 클러스터 수에 맞게 동적 생성
 5. 레이어별 Height/Tolerance 조정

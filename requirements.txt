@@ -1,0 +1,16 @@
+# Core numerical/image stack
+numpy>=1.26,<2.0
+opencv-python-headless>=4.8,<4.9
+
+# GUI
+PyQt5>=5.15
+
+# 3D preview
+pyvista
+pyvistaqt
+
+# Note:
+# FreeCAD Python modules (FreeCAD, Part, Mesh, MeshPart) are required by ui/worker.py
+# but are typically installed from system packages, not pip.
+# Ubuntu example:
+#   sudo apt-get install -y freecad-python3

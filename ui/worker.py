@@ -10,9 +10,8 @@ from typing import Any
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-# Headless FreeCAD binary/lib directory. Update this path per environment.
-# Example (Windows): r"C:\Program Files\FreeCAD 0.21\bin"
-FREECAD_BIN_PATH = os.environ.get("FREECAD_BIN_PATH", "/usr/lib/freecad-python3/lib")
+# Fallback FreeCAD library directory used when no environment variable is provided.
+DEFAULT_FREECAD_LIB_PATH = "/usr/lib/freecad-python3/lib"
 
 
 class CADWorker(QThread):
@@ -251,8 +250,27 @@ class CADWorker(QThread):
                     pass
 
     def _ensure_freecad_path(self) -> None:
-        if FREECAD_BIN_PATH and FREECAD_BIN_PATH not in sys.path:
-            sys.path.append(FREECAD_BIN_PATH)
+        candidate_paths: list[str] = []
+
+        freecad_bin_path = os.environ.get("FREECAD_BIN_PATH", "").strip()
+        if freecad_bin_path:
+            candidate_paths.extend(p for p in freecad_bin_path.split(os.pathsep) if p)
+
+        pythonpath = os.environ.get("PYTHONPATH", "").strip()
+        if pythonpath:
+            candidate_paths.extend(p for p in pythonpath.split(os.pathsep) if p)
+
+        candidate_paths.append(DEFAULT_FREECAD_LIB_PATH)
+
+        seen_paths: set[str] = set()
+        for raw_path in candidate_paths:
+            resolved = os.path.abspath(raw_path)
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+
+            if os.path.isdir(resolved) and resolved not in sys.path:
+                sys.path.append(resolved)
 
     def _check_interruption(self) -> None:
         if self.isInterruptionRequested():

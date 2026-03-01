@@ -380,13 +380,25 @@ class MainWindow(QMainWindow):
             return
 
         height, width = image_bgr.shape[:2]
-        if width >= 640 or height >= 640:
-            QMessageBox.warning(
+        if width > 640 or height > 640:
+            answer = QMessageBox.question(
                 self,
                 "Image Too Large",
-                "Image resolution too high. Please select an image smaller than 640x640 pixels.",
+                "Image is larger than 640x640. Do you want to automatically downscale it to fit?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
             )
-            return
+            if answer == QMessageBox.No:
+                return
+
+            scale = 640.0 / float(max(width, height))
+            new_w = max(1, int(round(width * scale)))
+            new_h = max(1, int(round(height * scale)))
+            image_bgr = cv2.resize(
+                image_bgr,
+                (new_w, new_h),
+                interpolation=cv2.INTER_AREA,
+            )
 
         color_clusters = self.processor.analyze_image_colors(image_bgr, k_clusters=5)
         if not color_clusters:
@@ -402,7 +414,7 @@ class MainWindow(QMainWindow):
         self.image_path = path
         self._rebuild_layers_from_clusters(color_clusters)
         self.generate_btn.setEnabled(True)
-        self._set_original_preview(path)
+        self._set_original_preview(image_bgr, path.split("/")[-1])
         self.view_stack.setCurrentIndex(0)
         self.mask_footer_label.setText("Mask Preview")
         self._update_mask_preview()
@@ -444,14 +456,14 @@ class MainWindow(QMainWindow):
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, layer)
             self.layer_widgets.append(layer)
 
-    def _set_original_preview(self, path: str) -> None:
-        pixmap = QPixmap(path)
+    def _set_original_preview(self, image_bgr: np.ndarray, file_name: str) -> None:
+        pixmap = self._mask_to_pixmap(image_bgr)
         if pixmap.isNull():
             self.original_section.preview_label.clear_preview()
             self.original_section.footer_label.setText("Invalid image")
             return
         self.original_section.preview_label.set_preview_pixmap(pixmap)
-        self.original_section.footer_label.setText(path.split("/")[-1])
+        self.original_section.footer_label.setText(file_name)
 
     def _collect_layer_settings(self) -> List[dict[str, int]]:
         return [
