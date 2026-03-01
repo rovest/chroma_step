@@ -175,6 +175,8 @@ class MainWindow(QMainWindow):
         self.layer_widgets: List[LayerWidget] = []
         self.image_path: str | None = None
         self.worker: CADWorker | None = None
+        self.generated_payload: list[dict[str, Any]] | None = None
+        self.preview_stl_path: str | None = None
         self.recent_export_dirs: List[str] = []
 
         self._build_ui()
@@ -248,8 +250,10 @@ class MainWindow(QMainWindow):
         self.generate_btn.clicked.connect(self.start_generation)
         self.export_stl_btn = QPushButton("Export as STL")
         self.export_stl_btn.setEnabled(False)
+        self.export_stl_btn.clicked.connect(self.export_stl)
         self.export_step_btn = QPushButton("Export as STEP")
         self.export_step_btn.setEnabled(False)
+        self.export_step_btn.clicked.connect(self.export_step)
 
         right_layout.addWidget(self.generate_btn)
         right_layout.addWidget(self.export_stl_btn)
@@ -292,6 +296,7 @@ class MainWindow(QMainWindow):
             target = self.processor.color_targets[i % len(self.processor.color_targets)]
             layer = LayerWidget(LayerState(i, target, title, initial_tolerance=35))
             layer.tolerance_released.connect(self._on_tolerance_adjusted)
+            layer.z_spin.valueChanged.connect(self._on_layer_parameter_changed)
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, layer)
             self.layer_widgets.append(layer)
 
@@ -410,6 +415,7 @@ class MainWindow(QMainWindow):
             return
 
         self.processor.set_image(image_bgr)
+        self._clear_generated_model_state()
 
         self.image_path = path
         self._rebuild_layers_from_clusters(color_clusters)
@@ -453,6 +459,7 @@ class MainWindow(QMainWindow):
                 )
             )
             layer.tolerance_released.connect(self._on_tolerance_adjusted)
+            layer.z_spin.valueChanged.connect(self._on_layer_parameter_changed)
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, layer)
             self.layer_widgets.append(layer)
 
@@ -471,6 +478,25 @@ class MainWindow(QMainWindow):
             for layer in self.layer_widgets
         ]
 
+    def _clear_generated_model_state(self) -> None:
+        if self.preview_stl_path:
+            try:
+                preview_path = Path(self.preview_stl_path)
+                if preview_path.exists():
+                    preview_path.unlink()
+            except Exception:
+                pass
+        self.generated_payload = None
+        self.preview_stl_path = None
+        self.export_stl_btn.setEnabled(False)
+        self.export_step_btn.setEnabled(False)
+
+    def _restore_action_buttons(self) -> None:
+        self.generate_btn.setEnabled(self.processor.has_image)
+        can_export = self.generated_payload is not None and self.preview_stl_path is not None
+        self.export_stl_btn.setEnabled(can_export)
+        self.export_step_btn.setEnabled(can_export)
+
     def _update_mask_preview(self) -> None:
         if not self.processor.has_image:
             return
@@ -481,9 +507,15 @@ class MainWindow(QMainWindow):
         self.mask_preview_label.set_preview_pixmap(pixmap)
 
     def _on_tolerance_adjusted(self) -> None:
+        self._clear_generated_model_state()
         self.view_stack.setCurrentIndex(0)
         self.mask_footer_label.setText("Mask Preview")
         self._update_mask_preview()
+
+    def _on_layer_parameter_changed(self, _value: float) -> None:
+        self._clear_generated_model_state()
+        self.view_stack.setCurrentIndex(0)
+        self.mask_footer_label.setText("Mask Preview")
 
     def _collect_generation_layers(self) -> list[dict[str, Any]]:
         return [
@@ -503,9 +535,10 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
 
+        self._clear_generated_model_state()
         self.generate_btn.setEnabled(False)
         self.progress_bar.setValue(0)
-        self.status_label.setText("Status: Starting CAD generation...")
+        self.status_label.setText("Status: Generating 3D preview...")
 
         try:
             generation_layers = self._collect_generation_layers()
@@ -515,9 +548,89 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Preparation Error", str(exc))
             return
 
+        self.generated_payload = worker_payload
+        self._start_worker(payload=worker_payload, job_mode="preview")
+
+    def export_stl(self) -> None:
+        self._start_export("stl")
+
+    def export_step(self) -> None:
+        self._start_export("step")
+
+    def _start_export(self, job_mode: str) -> None:
+        if self.generated_payload is None or self.preview_stl_path is None:
+            QMessageBox.information(
+                self,
+                "Preview Required",
+                "Generate and review a 3D preview before exporting.",
+            )
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        image_stem = Path(self.image_path).stem if self.image_path else "chromastep_model"
+        if job_mode == "stl":
+            selected_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export STL",
+                f"{image_stem}.stl",
+                "STL Files (*.stl)",
+            )
+            required_suffix = ".stl"
+            valid_suffixes = {".stl"}
+            status_text = "Status: Exporting STL..."
+        elif job_mode == "step":
+            selected_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export STEP",
+                f"{image_stem}.step",
+                "STEP Files (*.step *.stp)",
+            )
+            required_suffix = ".step"
+            valid_suffixes = {".step", ".stp"}
+            status_text = "Status: Exporting STEP..."
+        else:
+            QMessageBox.warning(self, "Export Error", f"Unsupported export mode: {job_mode}")
+            return
+
+        if not selected_path:
+            return
+
+        output_path = Path(selected_path)
+        if output_path.suffix.lower() not in valid_suffixes:
+            output_path = output_path.with_suffix(required_suffix)
+
+        self.generate_btn.setEnabled(False)
+        self.export_stl_btn.setEnabled(False)
+        self.export_step_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(status_text)
+        payload = self.generated_payload
+        if payload is None:
+            self._restore_action_buttons()
+            QMessageBox.information(
+                self,
+                "Preview Required",
+                "Generate and review a 3D preview before exporting.",
+            )
+            return
+        self._start_worker(
+            payload=payload,
+            job_mode=job_mode,
+            output_path=str(output_path),
+        )
+
+    def _start_worker(
+        self,
+        payload: list[dict[str, Any]],
+        job_mode: str,
+        output_path: str | None = None,
+    ) -> None:
         self.worker = CADWorker(
-            payload=worker_payload,
+            payload=payload,
             image_path=self.image_path,
+            output_path=output_path,
+            job_mode=job_mode,
             parent=self,
         )
         self.worker.progress_signal.connect(self.progress_bar.setValue)
@@ -530,35 +643,72 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Status: {message}")
 
     def _on_worker_finished(self, success: bool, message: str) -> None:
-        self.generate_btn.setEnabled(self.processor.has_image)
-        if success:
-            self.status_label.setText("Status: CAD generation complete.")
-            self._render_stl_in_viewer(message)
-            export_dir = self._extract_export_dir(message)
-            if export_dir:
-                self._add_recent_export(export_dir)
-            self._show_generation_complete_dialog(message, export_dir)
-        else:
-            self.status_label.setText("Status: CAD generation canceled.")
-            QMessageBox.warning(self, "Generation Canceled", message)
+        active_mode = self.worker.job_mode if self.worker is not None else "preview"
 
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
+
+        if success:
+            if active_mode == "preview":
+                preview_stl = self._extract_message_value(message, "PREVIEW_STL")
+                if not preview_stl:
+                    self._clear_generated_model_state()
+                    self.status_label.setText("Status: Preview generation failed.")
+                    QMessageBox.warning(
+                        self,
+                        "Preview Error",
+                        "Preview STL path was not returned by the worker.",
+                    )
+                else:
+                    self.preview_stl_path = preview_stl
+                    self._render_stl_in_viewer(preview_stl)
+                    self.status_label.setText("Status: 3D preview ready. Review and export.")
+            elif active_mode == "stl":
+                stl_path = self._extract_message_value(message, "STL")
+                if stl_path:
+                    self._add_recent_export(str(Path(stl_path).parent))
+                    QMessageBox.information(self, "Export Complete", f"STL saved:\n{stl_path}")
+                self.status_label.setText("Status: STL export complete.")
+            elif active_mode == "step":
+                step_path = self._extract_message_value(message, "STEP")
+                if step_path:
+                    self._add_recent_export(str(Path(step_path).parent))
+                    QMessageBox.information(self, "Export Complete", f"STEP saved:\n{step_path}")
+                self.status_label.setText("Status: STEP export complete.")
+            else:
+                self.status_label.setText("Status: Operation complete.")
+        else:
+            if active_mode == "preview":
+                self._clear_generated_model_state()
+                self.status_label.setText("Status: Preview generation canceled.")
+            else:
+                self.status_label.setText("Status: Export canceled.")
+            QMessageBox.warning(self, "Operation Canceled", message)
+
+        self._restore_action_buttons()
 
     def _on_worker_error(self, error_text: str) -> None:
-        self.generate_btn.setEnabled(self.processor.has_image)
-        self.status_label.setText("Status: CAD generation error.")
-        QMessageBox.critical(self, "CAD Worker Error", error_text)
+        active_mode = self.worker.job_mode if self.worker is not None else "preview"
+
+        if active_mode == "preview":
+            self._clear_generated_model_state()
+
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
+
+        if active_mode == "preview":
+            self.status_label.setText("Status: Preview generation error.")
+        else:
+            self.status_label.setText("Status: Export error.")
+        self._restore_action_buttons()
+        QMessageBox.critical(self, "CAD Worker Error", error_text)
 
     def _on_progress_changed(self, value: int) -> None:
         self.progress_percent.setText(f"{value}%")
 
-    def _render_stl_in_viewer(self, worker_message: str) -> None:
-        stl_path = self._extract_stl_path(worker_message)
+    def _render_stl_in_viewer(self, stl_path: str) -> None:
         if not stl_path:
             return
         try:
@@ -585,18 +735,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "3D Preview Error", f"Failed to load STL preview:\n{exc}")
 
-    def _show_generation_complete_dialog(self, message: str, export_dir: str | None) -> None:
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Generation Complete")
-        dialog.setIcon(QMessageBox.Information)
-        dialog.setText("3D model files were generated successfully.")
-        dialog.setDetailedText(message)
-        open_btn = dialog.addButton("Open Folder", QMessageBox.ActionRole)
-        dialog.addButton(QMessageBox.Ok)
-        dialog.exec_()
-        if dialog.clickedButton() is open_btn and export_dir:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(export_dir))
-
     def _add_recent_export(self, export_dir: str) -> None:
         if export_dir in self.recent_export_dirs:
             self.recent_export_dirs.remove(export_dir)
@@ -615,25 +753,13 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     @staticmethod
-    def _extract_stl_path(text: str) -> str | None:
+    def _extract_message_value(text: str, key: str) -> str | None:
+        key_prefix = f"{key.lower()}:"
         candidate_lines = [line.strip() for line in text.splitlines() if line.strip()]
         for line in candidate_lines:
-            lower = line.lower()
-            if lower.startswith("stl:"):
-                path = line.split(":", 1)[1].strip()
-                return path if path else None
-            if lower.endswith(".stl"):
-                return line
-        return None
-
-    @staticmethod
-    def _extract_export_dir(text: str) -> str | None:
-        candidate_lines = [line.strip() for line in text.splitlines() if line.strip()]
-        for line in candidate_lines:
-            lower = line.lower()
-            if lower.startswith("export_dir:"):
-                path = line.split(":", 1)[1].strip()
-                return path if path else None
+            if line.lower().startswith(key_prefix):
+                value = line.split(":", 1)[1].strip()
+                return value if value else None
         return None
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802

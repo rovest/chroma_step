@@ -20,7 +20,7 @@ ChromaStep 3D는 2D 이미지를 색상별로 분리해 각 레이어를 서로 
 - 레이어별 높이(mm), tolerance 조정
 - 2D 마스크 프리뷰 + 3D 뷰어(PyvistaQt)
 - 백그라운드 스레드(QThread) 기반 CAD 생성
-- STEP/STL/metadata 파일 저장
+- 3D 미리보기 생성 후, 버튼 기반 STL/STEP 내보내기
 
 ---
 
@@ -37,7 +37,7 @@ chroma_step/
 └── ui/
     ├── __init__.py
     ├── main_window.py            # 메인 UI, 2D/3D 뷰 전환
-    └── worker.py                 # FreeCAD CAD 생성/저장 스레드
+    └── worker.py                 # FreeCAD CAD 미리보기/내보내기 스레드
 ```
 
 실제 생성 파이프라인은 `ui/worker.py` + `core/color_processor.py`를 사용합니다.
@@ -79,17 +79,15 @@ python -m pip install pyvista pyvistaqt "opencv-python-headless>=4.8,<4.9" "nump
 
 ## 5. FreeCAD 경로 설정
 
-`ui/worker.py`는 `FREECAD_BIN_PATH`와 `PYTHONPATH`를 순서대로 확인해
+`ui/worker.py`는 `FREECAD_BIN_PATH`를 우선 사용해
 FreeCAD 라이브러리 경로를 찾습니다.
 
 ```bash
 export FREECAD_BIN_PATH=/usr/lib/freecad-python3/lib
 ```
 
-또는:
-```bash
-export PYTHONPATH=/usr/lib/freecad-python3/lib:$PYTHONPATH
-```
+`PYTHONPATH`에 AppImage 경로(예: `/opt/freecad/squashfs-root/...`)를 넣으면
+PyQt5/Qt 런타임 충돌이 날 수 있으므로 권장하지 않습니다.
 
 Windows 예시:
 ```powershell
@@ -119,11 +117,10 @@ python main.py
 5. 레이어별 Height/Tolerance 조정
    - 높이 스핀의 버튼 step은 `1.2mm`
    - 수동 타이핑 값은 그대로 허용
-6. `Generate 3D Solid Model` 실행
-7. 완료 후:
-   - 좌측 3D 뷰로 자동 전환
-   - 결과 폴더 열기 가능
-   - Recent Results 목록에 최근 작업(최대 5개) 기록
+6. `Generate 3D Solid Model` 실행 (미리보기 생성)
+7. 좌측 3D 뷰에서 결과 검토
+8. `Export as STL` 또는 `Export as STEP` 클릭 후 저장 경로 선택
+9. 내보내기 완료 후 Recent Results 목록에 최근 저장 위치(최대 5개) 기록
 
 ---
 
@@ -184,26 +181,10 @@ python main.py
 
 ---
 
-## 10. 출력 파일 구조
+## 10. 출력 파일 저장 방식
 
-기본 루트:
-```text
-~/ChromaStep/exports/
-```
-
-작업별 폴더:
-```text
-YYYY-MM-DD_HH-MM-SS_<image_stem>/
-```
-
-예시:
-```text
-~/ChromaStep/exports/2026-02-27_11-59-10_logo/
-├── final_relief.step
-├── final_relief.stl
-├── metadata.json
-└── error.log            # 실패 시 생성
-```
+- `Generate 3D Solid Model`은 미리보기만 생성합니다.
+- 실제 파일은 `Export as STL` 또는 `Export as STEP` 버튼에서 사용자가 선택한 경로로 저장됩니다.
 
 ---
 
@@ -220,7 +201,6 @@ YYYY-MM-DD_HH-MM-SS_<image_stem>/
 ### 11.3 STL이 비정상(구멍/깨짐)
 - 레이어 tolerance를 과도하게 넓히지 않기
 - 이미지 노이즈/아주 작은 텍스트를 줄인 입력 사용
-- metadata의 `valid_solid_count`, `meshed_solid_count` 확인
 
 ### 11.4 PyVista 렌더 실패
 - STL 로드 후 `clean().triangulate()` 수행
@@ -234,4 +214,3 @@ YYYY-MM-DD_HH-MM-SS_<image_stem>/
 - UI 흐름: `ui/main_window.py`
 - 백그라운드 CAD 처리: `ui/worker.py`
 - CV/컨투어 추출: `core/color_processor.py`
-
